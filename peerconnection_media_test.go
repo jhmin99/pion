@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,7 +22,6 @@ import (
 	"time"
 
 	"github.com/pion/logging"
-	"github.com/pion/randutil"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
@@ -323,7 +323,7 @@ func TestPeerConnection_Media_Disconnected(t *testing.T) {
 	m := &MediaEngine{}
 	assert.NoError(t, m.RegisterDefaultCodecs())
 
-	pcOffer, pcAnswer, wan := createVNetPair(t)
+	pcOffer, pcAnswer, wan := createVNetPair(t, nil)
 
 	keepPackets := &atomicBool{}
 	keepPackets.set(true)
@@ -778,7 +778,7 @@ func TestAddTransceiverFromTrackFailsRecvOnly(t *testing.T) {
 func TestPlanBMediaExchange(t *testing.T) {
 	runTest := func(trackCount int, t *testing.T) {
 		addSingleTrack := func(p *PeerConnection) *TrackLocalStaticSample {
-			track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: MimeTypeVP8}, fmt.Sprintf("video-%d", randutil.NewMathRandomGenerator().Uint32()), fmt.Sprintf("video-%d", randutil.NewMathRandomGenerator().Uint32()))
+			track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: MimeTypeVP8}, fmt.Sprintf("video-%d", util.RandUint32()), fmt.Sprintf("video-%d", util.RandUint32()))
 			assert.NoError(t, err)
 
 			_, err = p.AddTrack(track)
@@ -1020,7 +1020,7 @@ func TestPeerConnection_Simulcast_Probe(t *testing.T) {
 					if len(track.bindings) == 1 {
 						_, err = track.bindings[0].writeStream.WriteRTP(&rtp.Header{
 							Version: 2,
-							SSRC:    randutil.NewMathRandomGenerator().Uint32(),
+							SSRC:    util.RandUint32(),
 						}, []byte{0, 1, 2, 3, 4, 5})
 						assert.NoError(t, err)
 					}
@@ -1779,5 +1779,78 @@ func TestPeerConnection_Zero_PayloadType(t *testing.T) {
 		}
 	}()
 
+	closePairNow(t, pcOffer, pcAnswer)
+}
+
+// Assert that NACKs work E2E with no extra configuration. If media is sent over a lossy connection
+// the user gets retransmitted RTP packets with no extra configuration
+func Test_PeerConnection_RTX_E2E(t *testing.T) {
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	pcOffer, pcAnswer, wan := createVNetPair(t, nil)
+
+	wan.AddChunkFilter(func(vnet.Chunk) bool {
+		return rand.Intn(5) != 4 //nolint: gosec
+	})
+
+	track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: MimeTypeVP8}, "track-id", "stream-id")
+	assert.NoError(t, err)
+
+	rtpSender, err := pcOffer.AddTrack(track)
+	assert.NoError(t, err)
+
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
+
+	rtxSsrc := rtpSender.GetParameters().Encodings[0].RTX.SSRC
+	ssrc := rtpSender.GetParameters().Encodings[0].SSRC
+
+	rtxRead, rtxReadCancel := context.WithCancel(context.Background())
+	pcAnswer.OnTrack(func(track *TrackRemote, _ *RTPReceiver) {
+		for {
+			pkt, attributes, readRTPErr := track.ReadRTP()
+			if errors.Is(readRTPErr, io.EOF) {
+				return
+			} else if pkt.PayloadType == 0 {
+				continue
+			}
+
+			assert.NotNil(t, pkt)
+			assert.Equal(t, pkt.SSRC, uint32(ssrc))
+			assert.Equal(t, pkt.PayloadType, uint8(96))
+
+			rtxPayloadType := attributes.Get(AttributeRtxPayloadType)
+			rtxSequenceNumber := attributes.Get(AttributeRtxSequenceNumber)
+			rtxSSRC := attributes.Get(AttributeRtxSsrc)
+			if rtxPayloadType != nil && rtxSequenceNumber != nil && rtxSSRC != nil {
+				assert.Equal(t, rtxPayloadType, uint8(97))
+				assert.Equal(t, rtxSSRC, uint32(rtxSsrc))
+
+				rtxReadCancel()
+			}
+		}
+	})
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+	func() {
+		for {
+			select {
+			case <-time.After(20 * time.Millisecond):
+				writeErr := track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second})
+				assert.NoError(t, writeErr)
+			case <-rtxRead.Done():
+				return
+			}
+		}
+	}()
+
+	assert.NoError(t, wan.Stop())
 	closePairNow(t, pcOffer, pcAnswer)
 }

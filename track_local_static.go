@@ -19,10 +19,10 @@ import (
 // Bind can be called multiple times, this stores the
 // result for a single bind call so that it can be used when writing
 type trackBinding struct {
-	id          string
-	ssrc        SSRC
-	payloadType PayloadType
-	writeStream TrackLocalWriter
+	id                          string
+	ssrc, ssrcRTX, ssrcFEC      SSRC
+	payloadType, payloadTypeRTX PayloadType
+	writeStream                 TrackLocalWriter
 }
 
 // TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
@@ -59,7 +59,7 @@ func WithRTPStreamID(rid string) func(*TrackLocalStaticRTP) {
 
 // Bind is called by the PeerConnection after negotiation is complete
 // This asserts that the code requested is supported by the remote peer.
-// If so it setups all the state (SSRC and PayloadType) to have a call
+// If so it sets up all the state (SSRC and PayloadType) to have a call
 func (s *TrackLocalStaticRTP) Bind(t TrackLocalContext) (RTPCodecParameters, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,11 +67,15 @@ func (s *TrackLocalStaticRTP) Bind(t TrackLocalContext) (RTPCodecParameters, err
 	parameters := RTPCodecParameters{RTPCodecCapability: s.codec}
 	if codec, matchType := codecParametersFuzzySearch(parameters, t.CodecParameters()); matchType != codecMatchNone {
 		s.bindings = append(s.bindings, trackBinding{
-			ssrc:        t.SSRC(),
-			payloadType: codec.PayloadType,
-			writeStream: t.WriteStream(),
-			id:          t.ID(),
+			ssrc:           t.SSRC(),
+			ssrcRTX:        t.SSRCRetransmission(),
+			ssrcFEC:        t.SSRCForwardErrorCorrection(),
+			payloadType:    codec.PayloadType,
+			payloadTypeRTX: findRTXPayloadType(codec.PayloadType, t.CodecParameters()),
+			writeStream:    t.WriteStream(),
+			id:             t.ID(),
 		})
+
 		return codec, nil
 	}
 

@@ -4,6 +4,7 @@
 package webrtc
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/pion/webrtc/v4/internal/fmtp"
@@ -122,4 +123,16 @@ func codecParametersFuzzySearch(needle RTPCodecParameters, haystack []RTPCodecPa
 	}
 
 	return RTPCodecParameters{}, codecMatchNone
+}
+
+// Given a CodecParameters find the RTX CodecParameters if one exists
+func findRTXPayloadType(needle PayloadType, haystack []RTPCodecParameters) PayloadType {
+	aptStr := fmt.Sprintf("apt=%d", needle)
+	for _, c := range haystack {
+		if aptStr == c.SDPFmtpLine {
+			return c.PayloadType
+		}
+	}
+
+	return PayloadType(0)
 }
